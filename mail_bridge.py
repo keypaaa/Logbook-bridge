@@ -47,6 +47,7 @@ def is_valid_pdf_attachment(attachment):
     content = attachment.content
     if not content or len(content) > MAX_PDF_SIZE_BYTES:
         return False
+    # Проверка магических байтов %PDF- в начале файла
     if b'%PDF-' not in content[:1024]:
         return False
     return True
@@ -83,7 +84,7 @@ def extract_payslip_month_info(text_str):
     year = int(year_match.group(1))
 
     for prefix, m_idx in MONTH_PREFIXES:
-        if re.search(r'(?:^|[\s\.\(\-_])' + prefix, s):
+        if re.search(r'(?:^|[\s\.\(\)\-_])' + prefix, s):
             month_key = f"{year}_{m_idx}"
             yyyy_mm = f"{year}-{m_idx + 1:02d}"
             return month_key, yyyy_mm
@@ -118,11 +119,14 @@ def fetch_latest_report():
             access_type=DELEGATE
         )
 
+        # Фильтруем на самом сервере Exchange только письма с вложениями
         try:
             base_qs = account.inbox.filter(has_attachments=True)
         except Exception:
             base_qs = account.inbox.all()
 
+        # Для квитков расширяем верхнюю границу поиска на +45 дней,
+        # так как квиток за месяц приходит в следующем месяце
         payslip_date_to_str = date_to_str
         req_month_from = date_from_str[:7] if len(date_from_str) >= 7 else ""
         req_month_to = date_to_str[:7] if len(date_to_str) >= 7 else ""
@@ -134,6 +138,7 @@ def fetch_latest_report():
             except Exception:
                 payslip_date_to_str = date_to_str
 
+        # ШАГ 1 ДЛЯ ЗАГРУЗКИ ЗА ПЕРИОД / ГОД: Быстрый поиск писем (рейсы + квитки)
         if action == 'list' and date_from_str and date_to_str:
             qs = base_qs.only(
                 'subject', 'datetime_received', 'message_id', 'sender'
@@ -156,9 +161,12 @@ def fetch_latest_report():
 
                 raw_subj = getattr(item, 'subject', '') or ''
 
+                # 1. Проверка на расчетный листок по зарплате (с учетом +45 дней)
                 if is_payslip_email(item) and date_from_str <= item_date_str <= payslip_date_to_str:
                     p_key, p_ym = extract_payslip_month_info(raw_subj)
-                    if p_ym and req_month_from and req_month_to:
+                    # Если письмо пришло уже ПОСЛЕ конца выбранного периода (в окне +45 дней),
+                    # проверяем, что сам расчетный месяц квитка входит в запрошенный период
+                    if item_date_str > date_to_str and p_ym and req_month_from and req_month_to:
                         if not (req_month_from <= p_ym <= req_month_to):
                             continue
                     items_list.append({
@@ -173,6 +181,7 @@ def fetch_latest_report():
                     })
                     continue
 
+                # 2. Проверка на отчет по рейсу (строго в выбранном диапазоне дат)
                 if date_from_str <= item_date_str <= date_to_str:
                     if is_flight_report_email(item, subject_filter):
                         items_list.append({
@@ -192,6 +201,7 @@ def fetch_latest_report():
                 "items": items_list
             })
 
+        # ШАГ 2 ДЛЯ ЗАГРУЗКИ ЗА ПЕРИОД / ГОД: Скачивание одного конкретного PDF (отчета или квитка)
         if action == 'fetch_one':
             item_id = (data.get('itemId') or '').strip()
             msg_id = (data.get('messageId') or '').strip()
@@ -242,6 +252,7 @@ def fetch_latest_report():
 
             return jsonify({"skip": True, "reason": "no_valid_pdf"})
 
+        # Режим обратной совместимости (пакетный диапазон за один запрос)
         if date_from_str and date_to_str:
             qs_range = base_qs.only(
                 'subject', 'datetime_received', 'message_id', 'sender'
@@ -264,7 +275,7 @@ def fetch_latest_report():
                 is_fr = (not is_ps) and (date_from_str <= item_date_str <= date_to_str) and is_flight_report_email(item, subject_filter)
 
                 if is_ps or is_fr:
-                    if is_ps and req_month_from and req_month_to:
+                    if is_ps and item_date_str > date_to_str and req_month_from and req_month_to:
                         _, p_ym = extract_payslip_month_info(raw_subj)
                         if p_ym and not (req_month_from <= p_ym <= req_month_to):
                             continue
@@ -297,6 +308,7 @@ def fetch_latest_report():
                 "reports": reports_list
             })
 
+        # Стандартный режим («Крайний рейс»): ищем самый свежий отчет И самый свежий квиток среди последних 60 писем
         qs_latest = base_qs.only(
             'subject', 'datetime_received', 'message_id', 'sender'
         ).order_by('-datetime_received')
@@ -310,6 +322,7 @@ def fetch_latest_report():
 
             raw_subj = getattr(item, 'subject', '') or ''
 
+            # 1. Захватываем самый свежий квиток по зарплате (если есть в последних 60 письмах)
             if latest_payslip_payload is None and is_payslip_email(item):
                 full_ps = account.inbox.get(id=item.id)
                 for attachment in (getattr(full_ps, 'attachments', None) or []):
@@ -331,6 +344,7 @@ def fetch_latest_report():
                         }
                         break
 
+            # 2. Захватываем самый свежий отчет по рейсу
             if latest_flight_payload is None and is_flight_report_email(item, subject_filter):
                 full_fr = account.inbox.get(id=item.id)
                 for attachment in (getattr(full_fr, 'attachments', None) or []):
@@ -365,7 +379,7 @@ def fetch_latest_report():
 
         return jsonify({"error": "Письмо с PDF-отчетом от @uzairways.com не найдено среди последних 60 писем."}), 404
 
-    exceptException as e:
+    except Exception as e:
         return jsonify({"error": str(e)}), 500
 
 if __name__ == '__main__':
