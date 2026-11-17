@@ -2,11 +2,14 @@ import os
 import re
 import json
 import base64
+import urllib3
 from datetime import datetime, timedelta
 import requests
 from flask import Flask, request, jsonify
 from flask_cors import CORS
 from exchangelib import Credentials, Account, Configuration, DELEGATE, FileAttachment
+
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 app = Flask(__name__)
 CORS(app)
@@ -96,12 +99,13 @@ def extract_payslip_month_info(text_str):
 # ==============================================================================
 
 def normalize_zk_text(text):
-    """Декодирует \\uXXXX, \\xXX и \\/ в ответах ZK zkmx и zkau."""
+    """Декодирует \\\\uXXXX, \\uXXXX, \\xXX, \\' и \\/ в ответах ZK zkmx и zkau."""
     if not text:
         return ""
-    s = re.sub(r'\\u([0-9a-fA-F]{4})', lambda m: chr(int(m.group(1), 16)), text)
+    s = re.sub(r'\\\\u([0-9a-fA-F]{4})', lambda m: chr(int(m.group(1), 16)), text)
+    s = re.sub(r'\\u([0-9a-fA-F]{4})', lambda m: chr(int(m.group(1), 16)), s)
     s = re.sub(r'\\x([0-9a-fA-F]{2})', lambda m: chr(int(m.group(1), 16)), s)
-    s = s.replace(r'\/', '/')
+    s = s.replace(r'\/', '/').replace(r"\'", "'").replace(r'\"', '"')
     return s
 
 def extract_zk_dtid_and_prefix(raw_text):
@@ -116,7 +120,7 @@ def extract_zk_dtid_and_prefix(raw_text):
             dtid = m2.group(1)
 
     prefix = None
-    pm = re.search(r"zkmx\(\s*\[\s*0\s*,\s*['\"]([a-zA-Z0-9_]{4})_[a-zA-Z0-9_]*['\"]", text)
+    pm = re.search(r"zkmx\(\s*\[\s*0\s*,\s*['\"]([a-zA-Z0-9_]{4})[a-zA-Z0-9_]*['\"]", text)
     if not pm:
         pm = re.search(r"\[\s*['\"]zul\.[a-zA-Z0-9_.]+['\"]\s*,\s*['\"]([a-zA-Z0-9_]{4})[0-9a-zA-Z_]+['\"]", text)
     if pm:
@@ -135,7 +139,7 @@ def find_zk_widgets(raw_text):
     for m in header_rx.finditer(text):
         w_type = m.group(1)
         w_uuid = m.group(2)
-         brace_start = m.end() - 1
+        brace_start = m.end() - 1
         depth = 0
         in_str = None
         escape = False
@@ -174,16 +178,19 @@ def find_zk_widgets(raw_text):
 def meridian_login_session(email_or_login, password):
     """
     Авторизуется на https://faps.uzairways.com/web.meridian/login.zul
-    Использует логин без @uzairways.com (имя.фамилия) и пароль.
+    Пробует логин без домена (имя.фамилия, Имя.Фамилия) и полный email.
     """
     base_login = email_or_login.split('@')[0].strip() if '@' in email_or_login else email_or_login.strip()
-    candidates = [base_login]
-    if email_or_login.strip() not in candidates:
-        candidates.append(email_or_login.strip())
+    title_login = ".".join([p.capitalize() for p in base_login.split('.')])
+    candidates = []
+    for c in [base_login, title_login, base_login.lower(), email_or_login.strip()]:
+        if c and c not in candidates:
+            candidates.append(c)
 
     last_err = "Не удалось подключиться к Web Meridian"
     for login_candidate in candidates:
         sess = requests.Session()
+        sess.verify = False
         sess.headers.update({
             'User-Agent': 'Mozilla/5.0 (Linux; Android 14) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Mobile Safari/537.36',
             'Accept-Language': 'ru-RU,ru;q=0.9,en-US;q=0.8,en;q=0.7'
@@ -200,7 +207,6 @@ def meridian_login_session(email_or_login, password):
                 last_err = "Не удалось получить dtid страницы входа Web Meridian"
                 continue
 
-            # Детерминированные ID на login.zul: <PFX>g (Логин), <PFX>j (Пароль), <PFX>s (Войти)
             login_uuid = f"{pfx}g" if pfx else None
             pass_uuid = f"{pfx}j" if pfx else None
             enter_uuid = f"{pfx}s" if pfx else None
@@ -232,11 +238,15 @@ def meridian_login_session(email_or_login, password):
                 'data_1': json.dumps({"value": password, "start": 0}),
                 'cmd_2': 'onClick',
                 'uuid_2': enter_uuid,
-                'data_2': json.dumps({"pageX": 15, "pageY": 15, "which": 1, "x": 15, "y": 15})
+                'data_2': json.dumps({"pageX": 15, "pageY": 15, "which": 1, "x": 15, "y": 15}),
+                'cmd_3': 'onOK',
+                'uuid_3': pass_uuid,
+                'data_3': json.dumps({"reference": pass_uuid, "which": 13})
             }
 
             au_headers = {
                 'Content-Type': 'application/x-www-form-urlencoded;charset=UTF-8',
+                'ZK-SID': '1',
                 'Origin': 'https://faps.uzairways.com',
                 'Referer': f"{MERIDIAN_BASE_URL}/login.zul"
             }
@@ -244,7 +254,7 @@ def meridian_login_session(email_or_login, password):
 
             r_wp = sess.get(f"{MERIDIAN_BASE_URL}/workplan.zul", timeout=20)
             wp_norm = normalize_zk_text(r_wp.text)
-            if r_wp.ok and ('workplan-table' in wp_norm or 'План работ' in wp_norm or 'Вылет (UTC)' in wp_norm):
+            if r_wp.ok and ('workplan-table' in wp_norm or 'План работ' in wp_norm or 'Вылет (UTC)' in wp_norm or 'Персональный налет' in wp_norm):
                 return sess, wp_norm
             else:
                 last_err = "Неверный логин или пароль Web Meridian"
@@ -272,8 +282,6 @@ def fetch_meridian_workplan_reports(sess, wp_initial_text, date_from_str=None, d
 
     combined_wp_text = wp_initial_text
 
-    # Сдвигаем начальную дату в Плане работ (<PFX>52) на 29 дней назад и нажимаем Обновить (<PFX>92),
-    # так как по умолчанию План работ открывается с сегодняшнего числа!
     if pfx:
         datebox_from_uuid = f"{pfx}52"
         refresh_btn_uuid = f"{pfx}92"
@@ -286,7 +294,6 @@ def fetch_meridian_workplan_reports(sess, wp_initial_text, date_from_str=None, d
             except Exception:
                 pass
 
-        # Пробуем обновить период в формате ZK Date ($d) и строковом формате dd.MM.yyyy
         for date_val in [
             {"$d": target_start_dt.strftime("%Y.%m.%d.00.00.00.000")},
             target_start_dt.strftime("%d.%m.%Y")
@@ -312,7 +319,6 @@ def fetch_meridian_workplan_reports(sess, wp_initial_text, date_from_str=None, d
 
     widgets = find_zk_widgets(combined_wp_text)
 
-    # Находим все строки рейсов и иконки "Полетное задание"
     report_targets = []
     seen_uuids = set()
     current_listitem_uuid = None
@@ -332,7 +338,6 @@ def fetch_meridian_workplan_reports(sess, wp_initial_text, date_from_str=None, d
                     'row_uuid': current_listitem_uuid
                 })
 
-    # Извлекаем даты перелетов пассажиром ([пас] / Пассажир по заданию)
     deadhead_dates = []
     current_date_str = None
     for w in widgets:
@@ -359,7 +364,6 @@ def fetch_meridian_workplan_reports(sess, wp_initial_text, date_from_str=None, d
             au_payload = {'dtid': dtid}
             cmd_idx = 0
 
-            # 1. Выделяем строку рейса в таблице
             if listbox_uuid and target['row_uuid']:
                 au_payload[f'cmd_{cmd_idx}'] = 'onSelect'
                 au_payload[f'uuid_{cmd_idx}'] = listbox_uuid
@@ -372,13 +376,11 @@ def fetch_meridian_workplan_reports(sess, wp_initial_text, date_from_str=None, d
                 })
                 cmd_idx += 1
 
-            # 2. Кликаем на саму иконку отчета в строке
             au_payload[f'cmd_{cmd_idx}'] = 'onClick'
             au_payload[f'uuid_{cmd_idx}'] = target['img_uuid']
             au_payload[f'data_{cmd_idx}'] = json.dumps({"pageX": 10, "pageY": 10, "which": 1, "x": 10, "y": 10})
             cmd_idx += 1
 
-            # 3. Если есть родительский макро-контейнер — кликаем и по нему
             if target['macro_uuid']:
                 au_payload[f'cmd_{cmd_idx}'] = 'onClick'
                 au_payload[f'uuid_{cmd_idx}'] = target['macro_uuid']
@@ -388,7 +390,6 @@ def fetch_meridian_workplan_reports(sess, wp_initial_text, date_from_str=None, d
             r_click = sess.post(f"{MERIDIAN_BASE_URL}/zkau", data=au_payload, headers=au_headers, timeout=20)
             click_norm = normalize_zk_text(r_click.text) if r_click.ok else ""
 
-            # Если иконка не открыла iframe, пробуем нажать нижнюю кнопку "Полетное задание" (<PFX>u2)
             if 'reports/dynamic-html/' not in click_norm and ft_btn_uuid:
                 r_btn = sess.post(f"{MERIDIAN_BASE_URL}/zkau", data={
                     'dtid': dtid,
@@ -428,22 +429,37 @@ def fetch_meridian_workplan_reports(sess, wp_initial_text, date_from_str=None, d
 
 def parse_zk_pft_rows(raw_zk_text):
     """
-    Извлекает строки правой таблицы рейсов из ответа personalFlightTime.zul (по 9 ячеек на рейс).
-    Работает как по структуре виджетов, так и напрямую по всем значениям value:'...' в тексте ZK.
+    Извлекает строки правой таблицы рейсов из ответа personalFlightTime.zul.
+    Разбирает каждую строку Listitem по ее ячейкам Listcell, чтобы пустой № п/з никогда не сдвигал столбцы!
     """
     text = normalize_zk_text(raw_zk_text)
-    labels = [m.group(1).strip() for m in re.finditer(r"\bvalue\s*:\s*['\"]([^'\"]*)['\"]", text)]
-
     rows = []
     date_rx = re.compile(r"^\d{2}\s+[а-яёА-ЯЁ]{3}[а-яёА-ЯЁ\.]*\s+\d{4}$")
-    i = 0
-    while i <= len(labels) - 8:
-        if date_rx.match(labels[i]):
-            row = labels[i:i+9] if (i + 9 <= len(labels)) else (labels[i:i+8] + ["0.0"])
-            rows.append(row)
-            i += 9
-        else:
-            i += 1
+
+    # Разбиваем текст по блокам Listitem
+    item_chunks = re.split(r"\[\s*['\"]zul\.sel\.Listitem['\"]\s*,", text)
+    for chunk in item_chunks[1:]:
+        cell_chunks = re.split(r"\[\s*['\"]zul\.sel\.Listcell['\"]\s*,", chunk)
+        if len(cell_chunks) >= 9:
+            cells = []
+            for c_chunk in cell_chunks[1:10]:
+                lbl_m = re.search(r"\[\s*['\"]zul\.wgt\.Label['\"][\s\S]{1,120}?\bvalue\s*:\s*['\"]([^'\"]*)['\"]", c_chunk)
+                cells.append(lbl_m.group(1).strip() if lbl_m else "")
+            if cells and date_rx.match(cells[0]):
+                rows.append(cells)
+
+    # Резервный проход по плоскому списку меток, если формат ответа отличается
+    if not rows:
+        labels = [m.group(1).strip() for m in re.finditer(r"\bvalue\s*:\s*['\"]([^'\"]*)['\"]", text)]
+        i = 0
+        while i <= len(labels) - 8:
+            if date_rx.match(labels[i]):
+                row = labels[i:i+9] if (i + 9 <= len(labels)) else (labels[i:i+8] + ["0.0"])
+                rows.append(row)
+                i += 9
+            else:
+                i += 1
+
     return rows
 
 
@@ -458,7 +474,6 @@ def fetch_meridian_personal_flight_time(sess, date_from_str, date_to_str):
 
     pft_norm = normalize_zk_text(r_pft.text)
     dtid, pfx = extract_zk_dtid_and_prefix(pft_norm)
-    widgets = find_zk_widgets(pft_norm)
     if not dtid:
         return []
 
@@ -475,23 +490,16 @@ def fetch_meridian_personal_flight_time(sess, date_from_str, date_to_str):
             cur = datetime(cur.year, cur.month + 1, 1)
 
     months_listbox_uuid = f"{pfx}d2" if pfx else None
-    listboxes = [w for w in widgets if 'Listbox' in w['type']]
-    if not months_listbox_uuid and listboxes:
-        months_listbox_uuid = listboxes[0]['uuid']
 
-    # Находим UUID каждой строки месяца (Listitem) в левой таблице
+    # Прямой поиск пар (item_uuid, 'месяц ГГГГ') по регулярному выражению
     month_item_uuids = []
-    last_listitem_uuid = None
-    for w in widgets:
-        if 'Listitem' in w['type']:
-            last_listitem_uuid = w['uuid']
-        elif 'Label' in w['type'] and last_listitem_uuid:
-            val_m = re.search(r"value\s*:\s*['\"]([^'\"]+)['\"]", w['props_raw'])
-            if val_m:
-                lbl_val = val_m.group(1).strip().lower()
-                if lbl_val in target_month_labels:
-                    month_item_uuids.append((lbl_val, last_listitem_uuid))
-                    last_listitem_uuid = None
+    seen_m_uuids = set()
+    for m in re.finditer(r"\[\s*['\"]zul\.sel\.Listitem['\"]\s*,\s*['\"]([a-zA-Z0-9_]+)['\"][\s\S]{1,350}?\bvalue\s*:\s*['\"]([а-яёА-ЯЁ]+\s+20\d{2})['\"]", pft_norm):
+        item_uuid = m.group(1)
+        lbl_val = m.group(2).strip().lower()
+        if lbl_val in target_month_labels and item_uuid not in seen_m_uuids:
+            seen_m_uuids.add(item_uuid)
+            month_item_uuids.append((lbl_val, item_uuid))
 
     all_rows = []
     initial_rows = parse_zk_pft_rows(pft_norm)
@@ -541,7 +549,7 @@ def fetch_meridian_personal_flight_time(sess, date_from_str, date_to_str):
 
 @app.route('/', methods=['GET'])
 def home():
-    return "Гибридный мост Flight Log v3.1.1 (Web Meridian + Почта Exchange + Расчетные листки) работает штатно!"
+    return "Гибридный мост Flight Log v3.1.2 (Web Meridian + Почта Exchange + Расчетные листки) работает штатно!"
 
 
 @app.route('/fetch-latest-report', methods=['POST'])
@@ -581,11 +589,10 @@ def fetch_latest_report():
                 deadhead_dates = []
                 pft_rows = []
 
-                # 1. Всегда забираем быстрые строки из Персонального налета за выбранные месяцы,
-                # чтобы ВСЕ выполненные рейсы (и старше 30 дней, и текущего месяца) появились мгновенно!
+                # 1. Мгновенно забираем строки из Персонального налета за все выбранные месяцы
                 pft_rows = fetch_meridian_personal_flight_time(sess, date_from_str, date_to_str)
 
-                # 2. Если диапазон включает последние 30 дней (+60 дней вперед) — забираем полные карточки из Плана работ
+                # 2. Если диапазон затрагивает последние 30 дней (+60 дней вперед) — забираем полные карточки из Плана работ
                 if date_to_str >= cutoff_30d:
                     html_reports, deadhead_dates = fetch_meridian_workplan_reports(
                         sess, wp_text, date_from_str=date_from_str, date_to_str=date_to_str, latest_only=False
